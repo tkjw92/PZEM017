@@ -105,14 +105,14 @@ float PZEM017::readPower()
     return 0;
 }
 
-uint16_t PZEM017::readEnergy()
+float PZEM017::readEnergy()
 {
-    uint8_t res = node.readInputRegisters(0x0004, 1);
+    uint8_t res = node.readInputRegisters(0x0004, 2);
     if (res == node.ku8MBSuccess)
     {
-        return node.getResponseBuffer(0) * 0.001;
+        uint32_t energy = ((uint32_t)node.getResponseBuffer(0) << 16) | node.getResponseBuffer(1);
+        return energy * 0.001; // dalam kWh
     }
-
     return 0;
 }
 
