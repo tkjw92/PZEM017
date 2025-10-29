@@ -1,45 +1,284 @@
-#include <PZEM017.h>
+#include "PZEM017.h"
 
+// Inisialisasi static member
 PZEM017 *PZEM017::instance = nullptr;
-PZEM017::PZEM017() {};
-void PZEM017::operator()(uint8_t rx, uint8_t tx)
-{
-    this->rx = rx;
-    this->tx = tx;
 
-    this->instance = this;
+// ========== Constructor ==========
+
+PZEM017::PZEM017()
+    : serial(nullptr), dePinNum(0), rePinNum(0), slaveAddress(0), initialized(false)
+{
 }
 
-void PZEM017::begin(uint8_t new_slave_addr, uint16_t shunt, uint8_t de, uint8_t re)
+// ========== Public Methods ==========
+
+bool PZEM017::begin(Stream &serialPort, uint8_t slaveAddr, uint16_t shuntType, uint8_t dePin, uint8_t rePin)
 {
-    this->de = de;
-    this->re = re;
-    this->slave = new_slave_addr;
+    // Validasi parameter
+    if (slaveAddr == 0 || slaveAddr > 247)
+    {
+        return false;
+    }
 
-    sfserial.begin(9600, SWSERIAL_8N1, rx, tx);
+    // Set instance untuk callback (CRITICAL FIX #1)
+    instance = this;
 
-    pinMode(de, OUTPUT);
-    pinMode(re, OUTPUT);
+    // Simpan konfigurasi
+    this->serial = &serialPort;
+    this->slaveAddress = slaveAddr;
+    this->dePinNum = dePin;
+    this->rePinNum = rePin;
 
-    postTransmission();
+    // Setup RS485 control pins
+    pinMode(dePinNum, OUTPUT);
+    pinMode(rePinNum, OUTPUT);
 
+    // Set initial state ke RX mode
+    digitalWrite(rePinNum, LOW);
+    digitalWrite(dePinNum, LOW);
+
+    // Setup Modbus dengan callbacks
+    node.begin(slaveAddress, *serial);
     node.preTransmission(preTransmission);
     node.postTransmission(postTransmission);
 
-    changeAddress(slave);
-    delay(200);
-    setShunt(slave, shunt);
-    delay(200);
+    // Tunggu stabilisasi
+    delay(100);
+
+    // Set shunt value
+    if (!setShunt(shuntType))
+    {
+        initialized = false;
+        return false;
+    }
+
+    // Verifikasi koneksi dengan membaca voltage
+    delay(100);
+    if (!isConnected())
+    {
+        initialized = false;
+        return false;
+    }
+
+    initialized = true;
+    return true;
 }
+
+bool PZEM017::changeAddress(uint8_t newAddress)
+{
+    if (newAddress == 0 || newAddress > 247)
+    {
+        return false;
+    }
+
+    // Gunakan broadcast address untuk mengubah alamat
+    node.begin(ADDR_BROADCAST, *serial);
+
+    uint8_t result = node.writeSingleRegister(REG_ADDR_CHANGE, newAddress);
+
+    if (result != node.ku8MBSuccess)
+    {
+        // Kembalikan ke alamat semula
+        node.begin(slaveAddress, *serial);
+        return false;
+    }
+
+    // Tunggu perangkat memproses perubahan
+    delay(200);
+
+    // Update alamat dan verifikasi
+    slaveAddress = newAddress;
+    node.begin(slaveAddress, *serial);
+
+    // Verifikasi dengan mencoba membaca
+    bool connected = isConnected();
+
+    if (!connected)
+    {
+        // Rollback jika gagal (tidak bisa dilakukan jika device benar-benar berubah)
+        return false;
+    }
+
+    return true;
+}
+
+bool PZEM017::setShunt(uint16_t shuntType)
+{
+    if (!initialized && instance != this)
+    {
+        return false;
+    }
+
+    // Validasi shunt type
+    if (shuntType > SHUNT_300A)
+    {
+        return false;
+    }
+
+    uint8_t result = node.writeSingleRegister(REG_SHUNT, shuntType);
+
+    if (result != node.ku8MBSuccess)
+    {
+        return false;
+    }
+
+    delay(100); // Tunggu perangkat memproses
+    return true;
+}
+
+bool PZEM017::resetEnergy()
+{
+    if (!initialized)
+    {
+        return false;
+    }
+
+    // Buat frame manual untuk command custom 0x42
+    uint8_t frame[4];
+    frame[0] = slaveAddress;
+    frame[1] = CMD_RESET_ENERGY;
+
+    // Hitung CRC
+    uint16_t crc = calculateCRC16(frame, 2);
+    frame[2] = lowByte(crc);
+    frame[3] = highByte(crc);
+
+    // Kirim command
+    preTransmission();
+
+    serial->write(frame, 4);
+    serial->flush();
+
+    postTransmission();
+
+    // Tunggu respon (reset biasanya butuh waktu)
+    delay(500);
+
+    // Verifikasi dengan membaca energy (harusnya 0 atau mendekati 0)
+    float energy;
+    if (readEnergy(energy))
+    {
+        return (energy < 0.001); // Toleransi kecil
+    }
+
+    return false;
+}
+
+bool PZEM017::readVoltage(float &value)
+{
+    if (!initialized)
+    {
+        return false;
+    }
+
+    if (!readRegistersWithRetry(REG_VOLTAGE, 1))
+    {
+        return false;
+    }
+
+    // PZEM017: 1 LSB = 0.01V
+    value = node.getResponseBuffer(0) * 0.01f;
+    return true;
+}
+
+bool PZEM017::readCurrent(float &value)
+{
+    if (!initialized)
+    {
+        return false;
+    }
+
+    if (!readRegistersWithRetry(REG_CURRENT, 1))
+    {
+        return false;
+    }
+
+    // PZEM017: 1 LSB = 0.01A
+    value = node.getResponseBuffer(0) * 0.01f;
+    return true;
+}
+
+bool PZEM017::readPower(float &value)
+{
+    if (!initialized)
+    {
+        return false;
+    }
+
+    if (!readRegistersWithRetry(REG_POWER_L, 2))
+    {
+        return false;
+    }
+
+    // Ambil 2 register dan gabungkan (FIX #3: Endianness)
+    uint16_t lowWord = node.getResponseBuffer(0);  // Register 0x0002 (LSW)
+    uint16_t highWord = node.getResponseBuffer(1); // Register 0x0003 (MSW)
+
+    uint32_t powerRaw = combine32BitValue(lowWord, highWord);
+
+    // PZEM017: 1 LSB = 0.1W
+    value = powerRaw * 0.1f;
+    return true;
+}
+
+bool PZEM017::readEnergy(float &value)
+{
+    if (!initialized)
+    {
+        return false;
+    }
+
+    if (!readRegistersWithRetry(REG_ENERGY_L, 2))
+    {
+        return false;
+    }
+
+    // Ambil 2 register dan gabungkan (FIX #3: Endianness)
+    uint16_t lowWord = node.getResponseBuffer(0);  // Register 0x0004 (LSW)
+    uint16_t highWord = node.getResponseBuffer(1); // Register 0x0005 (MSW)
+
+    uint32_t energyRaw = combine32BitValue(lowWord, highWord);
+
+    // PZEM017: 1 LSB = 1Wh, konversi ke kWh
+    value = energyRaw * 0.001f;
+    return true;
+}
+
+bool PZEM017::readAll(float &voltage, float &current, float &power, float &energy)
+{
+    // Baca semua parameter dengan satu kali komunikasi untuk efisiensi
+    bool success = true;
+
+    success &= readVoltage(voltage);
+    success &= readCurrent(current);
+    success &= readPower(power);
+    success &= readEnergy(energy);
+
+    return success;
+}
+
+bool PZEM017::isConnected()
+{
+    if (!initialized && instance != this)
+    {
+        return false;
+    }
+
+    // Coba baca register voltage sebagai test koneksi
+    uint8_t result = node.readInputRegisters(REG_VOLTAGE, 1);
+    return (result == node.ku8MBSuccess);
+}
+
+// ========== Private Methods ==========
 
 void PZEM017::preTransmission()
 {
     if (instance)
     {
-        digitalWrite(instance->re, HIGH);
-        digitalWrite(instance->de, HIGH);
-
-        delayMicroseconds(500);
+        // Set RS485 ke TX mode
+        digitalWrite(instance->rePinNum, HIGH);
+        digitalWrite(instance->dePinNum, HIGH);
+        delayMicroseconds(RS485_DELAY_US);
     }
 }
 
@@ -47,82 +286,23 @@ void PZEM017::postTransmission()
 {
     if (instance)
     {
-        delayMicroseconds(500);
+        delayMicroseconds(RS485_DELAY_US);
 
-        digitalWrite(instance->re, LOW);
-        digitalWrite(instance->de, LOW);
+        // Set RS485 ke RX mode
+        digitalWrite(instance->rePinNum, LOW);
+        digitalWrite(instance->dePinNum, LOW);
     }
 }
 
-void PZEM017::changeAddress(uint16_t new_addr)
-{
-    uint8_t general_address = 0xf8;
-    uint16_t reg_addr = 0x0002;
-
-    node.begin(general_address, sfserial);
-
-    node.writeSingleRegister(reg_addr, new_addr);
-}
-
-void PZEM017::setShunt(uint8_t addr, uint16_t shunt_value)
-{
-    uint16_t reg_addr = 0x0003;
-    node.begin(addr, sfserial);
-
-    node.writeSingleRegister(reg_addr, shunt_value);
-}
-
-float PZEM017::readVoltage()
-{
-    uint8_t res = node.readInputRegisters(0x0000, 1);
-    if (res == node.ku8MBSuccess)
-    {
-        return node.getResponseBuffer(0) * 0.01;
-    }
-
-    return 0;
-}
-
-float PZEM017::readCurrent()
-{
-    uint8_t res = node.readInputRegisters(0x0001, 1);
-    if (res == node.ku8MBSuccess)
-    {
-        return node.getResponseBuffer(0) * 0.01;
-    }
-
-    return 0;
-}
-
-float PZEM017::readPower()
-{
-    uint8_t res = node.readInputRegisters(0x0002, 2);
-    if (res == node.ku8MBSuccess)
-    {
-        return (((uint32_t)node.getResponseBuffer(1) << 16) | node.getResponseBuffer(0)) * 0.1;
-    }
-
-    return 0;
-}
-
-float PZEM017::readEnergy()
-{
-    uint8_t res = node.readInputRegisters(0x0004, 2);
-    if (res == node.ku8MBSuccess)
-    {
-        uint32_t energy = ((uint32_t)node.getResponseBuffer(1) << 16) | node.getResponseBuffer(0);
-        return energy * 0.001; // dalam kWh
-    }
-    return 0;
-}
-
-uint16_t modbus_crc16(uint8_t *buf, uint8_t len)
+uint16_t PZEM017::calculateCRC16(const uint8_t *buffer, size_t length)
 {
     uint16_t crc = 0xFFFF;
-    for (int pos = 0; pos < len; pos++)
+
+    for (size_t pos = 0; pos < length; pos++)
     {
-        crc ^= (uint16_t)buf[pos];
-        for (int i = 8; i != 0; i--)
+        crc ^= (uint16_t)buffer[pos];
+
+        for (uint8_t i = 8; i != 0; i--)
         {
             if ((crc & 0x0001) != 0)
             {
@@ -130,25 +310,40 @@ uint16_t modbus_crc16(uint8_t *buf, uint8_t len)
                 crc ^= 0xA001;
             }
             else
+            {
                 crc >>= 1;
+            }
         }
     }
+
     return crc;
 }
 
-void PZEM017::resetEnergy()
+bool PZEM017::readRegistersWithRetry(uint16_t regAddress, uint16_t regCount, uint8_t retries)
 {
-    const uint16_t cmd = 0x42;
-    uint8_t frame[4];
+    for (uint8_t attempt = 0; attempt < retries; attempt++)
+    {
+        uint8_t result = node.readInputRegisters(regAddress, regCount);
 
-    frame[0] = slave;
-    frame[1] = cmd;
-    uint16_t crc = modbus_crc16(frame, 2);
-    frame[2] = lowByte(crc);
-    frame[3] = highByte(crc);
+        if (result == node.ku8MBSuccess)
+        {
+            return true;
+        }
 
-    preTransmission();
-    sfserial.write(frame, 4);
-    sfserial.flush();
-    postTransmission();
+        // Jika gagal, tunggu sebelum retry
+        if (attempt < retries - 1)
+        {
+            delay(RETRY_DELAY_MS);
+        }
+    }
+
+    return false;
+}
+
+uint32_t PZEM017::combine32BitValue(uint16_t lowWord, uint16_t highWord)
+{
+    // PZEM017 menggunakan Little Endian format:
+    // Byte order: [LSB_low, MSB_low, LSB_high, MSB_high]
+    // Register order: [REG_L, REG_H]
+    return ((uint32_t)highWord << 16) | lowWord;
 }
