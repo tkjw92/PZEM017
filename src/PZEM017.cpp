@@ -110,7 +110,7 @@ float PZEM017::readEnergy()
     uint8_t res = node.readInputRegisters(0x0004, 2);
     if (res == node.ku8MBSuccess)
     {
-        uint32_t energy = ((uint32_t)node.getResponseBuffer(0) << 16) | node.getResponseBuffer(1);
+        uint32_t energy = ((uint32_t)node.getResponseBuffer(1) << 16) | node.getResponseBuffer(0);
         return energy * 0.001; // dalam kWh
     }
     return 0;
