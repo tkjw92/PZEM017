@@ -105,12 +105,12 @@ float PZEM017::readPower()
     return 0;
 }
 
-uint32_t PZEM017::readEnergy()
+uint16_t PZEM017::readEnergy()
 {
-    uint8_t res = node.readInputRegisters(0x0004, 2);
+    uint8_t res = node.readInputRegisters(0x0004, 1);
     if (res == node.ku8MBSuccess)
     {
-        return node.getResponseBuffer(0);
+        return node.getResponseBuffer(0) * 0.001;
     }
 
     return 0;

@@ -37,5 +37,5 @@ public:
     float readVoltage();
     float readCurrent();
     float readPower();
-    uint32_t readEnergy();
+    uint16_t readEnergy();
 };
